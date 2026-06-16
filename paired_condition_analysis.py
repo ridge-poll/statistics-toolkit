@@ -72,7 +72,7 @@ labels = [
 ]
 
 fig, axes = plt.subplots(1, len(metrics), figsize=(14, 4))
-fig.suptitle(f"Zebrafish SDs in Hypoosmotic Solution: {cond}", fontsize=14, fontweight="bold")
+fig.suptitle(f"Mice SDs in Hyperosmotic Solution: {cond}", fontsize=14, fontweight="bold")
 
 for ax, m, lbl in zip(axes, metrics, labels):
     subset = long_df[long_df["Metric"] == m]
@@ -147,7 +147,7 @@ for ax, m, lbl in zip(axes, metrics, labels):
             )
             p_text.append(f"p={pval:.3f}")
         else:
-            p_text.append(f"{cond}: n too small")
+            p_text.append("n<2")
 
     # --- Formatting ---
     ax.set_xticks(range(len(order)))

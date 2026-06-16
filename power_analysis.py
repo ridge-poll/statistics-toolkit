@@ -317,7 +317,7 @@ def plot_summary_table(display_df: pd.DataFrame):
             "Power (current)", "n (needed)", "n (MORE needed)"]
     tbl = display_df[cols].copy()
 
-    fig_h = max(3, 0.45 * len(tbl) + 1.5)
+    fig_h = max(3, 0.15 * len(tbl) + 1.5)
     fig, ax = plt.subplots(figsize=(14, fig_h))
     ax.axis("off")
 

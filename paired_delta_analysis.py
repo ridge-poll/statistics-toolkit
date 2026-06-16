@@ -169,7 +169,7 @@ for ax, m, lbl in zip(axes, metrics, labels):
             _, pval = ttest_1samp(values, 0)
             p_text.append(f"{cond}: p={pval:.3f}")
         else:
-            p_text.append(f"{cond}: n too small")
+            p_text.append(f"{cond}: n<2")
 
     ax.set_xticks(range(len(treatments)))
     ax.set_xticklabels(treatments)
@@ -186,6 +186,6 @@ for ax, m, lbl in zip(axes, metrics, labels):
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
 
-fig.suptitle("SD Properties in Zebrafish\n(Δ from Control)", fontsize=14, fontweight="bold")
+fig.suptitle("SD Properties in Mice\n(Δ from Control)", fontsize=14, fontweight="bold")
 plt.tight_layout()
 plt.show()
