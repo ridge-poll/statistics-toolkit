@@ -2,9 +2,22 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 # import seaborn as sns
-from scipy.stats import ttest_rel, ttest_1samp
 import tkinter as tk
 from tkinter import filedialog
+from scipy.stats import ttest_1samp, wilcoxon
+import argparse
+
+
+# ----- Flags and such -----
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--wilcoxon",
+    action="store_true",
+    help="Use Wilcoxon signed-rank test instead of one-sample t-test."
+)
+args = parser.parse_args()
+# -----------------------
+
 
 # ----- File picker -----
 root = tk.Tk()
@@ -88,7 +101,17 @@ delta_long = delta_df.melt(
 
 
 # Colors
-base_colors = ["tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
+base_colors = [
+    "tab:orange",
+    "tab:green",
+    "tab:red",
+    "tab:purple",
+    "tab:brown",
+    "tab:pink",
+    "tab:gray",
+    "tab:olive",
+    "tab:cyan"
+]
 my_palette = {}
 
 for cond, color in zip(treatments, base_colors):
@@ -166,7 +189,19 @@ for ax, m, lbl in zip(axes, metrics, labels):
         values = subset[subset["Condition"] == cond]["Value"].dropna()
 
         if len(values) > 1:
-            _, pval = ttest_1samp(values, 0)
+            if args.wilcoxon:
+                try:
+                    _, pval = wilcoxon(
+                        values,
+                        zero_method="wilcox",
+                        alternative="two-sided"
+                    )
+                except ValueError:
+                    p_text.append(f"{cond}: all equal")
+                    continue
+            else:
+                _, pval = ttest_1samp(values, 0)
+
             p_text.append(f"{cond}: p={pval:.3f}")
         else:
             p_text.append(f"{cond}: n<2")

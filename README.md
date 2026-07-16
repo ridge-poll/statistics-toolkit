@@ -34,6 +34,26 @@ This script performs within-dataset analysis across conditions.
 
 ---
 
+#### Optional: Wilcoxon Signed-Rank Test
+
+By default, the analysis scripts use paired Student's *t*-tests for statistical comparisons.
+
+For nonparametric paired analysis, either script can instead perform a two-sided Wilcoxon signed-rank test:
+
+```bash
+python paired_condition_analysis.py --wilcoxon
+```
+
+or
+
+```bash
+python paired_delta_analysis.py --wilcoxon
+```
+
+The `--wilcoxon` flag changes only the statistical hypothesis test. All summary metrics, paired-recording matching, plots, and visualizations remain unchanged.
+
+The power analysis script currently uses paired *t*-test power calculations and does not support Wilcoxon power estimation.
+
 ### 2. Paired Delta Analysis (`paired_delta_analysis.py`)
 
 This script computes control-normalized differences within each recording.
@@ -85,7 +105,8 @@ This script estimates statistical power and required sample size for paired expe
   - Event rate
   - Optional AUC normalization
 - Statistical testing:
-  - Paired t-tests (condition-level analysis)
+  - Paired t-tests (default)
+  - Wilcoxon signed-rank tests (`--wilcoxon` option)
   - One-sample t-tests (delta analysis)
 - Statistical power analysis:
   - achieved power estimation
