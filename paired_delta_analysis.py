@@ -114,6 +114,7 @@ base_colors = [
 ]
 my_palette = {}
 
+
 for cond, color in zip(treatments, base_colors):
     my_palette[cond] = color
 
