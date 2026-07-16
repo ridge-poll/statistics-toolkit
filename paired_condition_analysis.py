@@ -1,9 +1,20 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.stats import ttest_rel
+from scipy.stats import ttest_rel, wilcoxon
 import tkinter as tk
 from tkinter import filedialog
+import argparse
+
+# ----- Flags and such -----
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--wilcoxon",
+    action="store_true",
+    help="Use Wilcoxon signed-rank test instead of paired t-test."
+)
+args = parser.parse_args()
+
 
 # ----- File picker -----
 root = tk.Tk()
@@ -72,7 +83,7 @@ labels = [
 ]
 
 fig, axes = plt.subplots(1, len(metrics), figsize=(14, 4))
-fig.suptitle(f"Mice SDs in Hyperosmotic Solution: {cond}", fontsize=14, fontweight="bold")
+fig.suptitle(f"Zebrafish SDs in Hypoosmotic Solution: {cond}", fontsize=14, fontweight="bold")
 
 for ax, m, lbl in zip(axes, metrics, labels):
     subset = long_df[long_df["Metric"] == m]
@@ -140,11 +151,24 @@ for ax, m, lbl in zip(axes, metrics, labels):
         ).dropna()
 
         if len(merged) > 1:
-            _, pval = ttest_rel(
-                merged["Value_control"],
-                merged["Value_treat"],
-                nan_policy="omit"
-            )
+            if args.wilcoxon:
+                try:
+                    _, pval = wilcoxon(
+                        merged["Value_control"],
+                        merged["Value_treat"],
+                        zero_method="wilcox",
+                        alternative="two-sided"
+                    )
+                except ValueError:
+                    p_text.append("all equal")
+                    continue
+            else:
+                _, pval = ttest_rel(
+                    merged["Value_control"],
+                    merged["Value_treat"],
+                    nan_policy="omit"
+                )
+
             p_text.append(f"p={pval:.3f}")
         else:
             p_text.append("n<2")
