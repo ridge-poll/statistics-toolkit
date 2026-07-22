@@ -353,7 +353,7 @@ def plot_summary_table(display_df: pd.DataFrame):
 
         if already_sig or more == 0:
             bg = "#d4edda"   # green — already significant / powered
-        elif more <= 2:
+        elif more <= 5:
             bg = "#fff3cd"   # yellow — close
         else:
             bg = "#f8d7da"   # red — more work needed
@@ -368,7 +368,7 @@ def plot_summary_table(display_df: pd.DataFrame):
 
     legend_elements = [
         Patch(facecolor="#d4edda", label="Already significant / no more needed"),
-        Patch(facecolor="#fff3cd", label="Close — ≤2 more recordings"),
+        Patch(facecolor="#fff3cd", label="Close — ≤5 more recordings"),
         Patch(facecolor="#f8d7da", label="More recordings required"),
     ]
     ax.legend(handles=legend_elements, loc="lower center",
