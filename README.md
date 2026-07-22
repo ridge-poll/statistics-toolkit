@@ -47,14 +47,14 @@ python paired_condition_analysis.py --wilcoxon
 or
 
 ```bash
-python paired_delta_analysis.py --wilcoxon
+python delta_analysis.py --wilcoxon
 ```
 
 The `--wilcoxon` flag changes only the statistical hypothesis test. All summary metrics, paired-recording matching, plots, and visualizations remain unaltered.
 
 The power analysis script currently uses paired *t*-test power calculations and does not support Wilcoxon power estimation.
 
-### 2. Paired Delta Analysis (`paired_delta_analysis.py`)
+### 2. Paired Delta Analysis (`delta_analysis.py`)
 
 This script computes control-normalized differences within each recording.
 

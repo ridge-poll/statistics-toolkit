@@ -82,8 +82,14 @@ labels = [
     "mV·sec"
 ]
 
+# Give each recording a fixed horizontal jitter
+recording_offsets = {
+    rec: np.random.uniform(-0.05, 0.05)
+    for rec in summary["Recording"].unique()
+}
+
 fig, axes = plt.subplots(1, len(metrics), figsize=(14, 4))
-fig.suptitle(f"Zebrafish SDs in Hypoosmotic Solution: {cond}", fontsize=14, fontweight="bold")
+fig.suptitle(f"Cross-Species SDs in Hypersmotic Solution: {cond}", fontsize=14, fontweight="bold")
 
 for ax, m, lbl in zip(axes, metrics, labels):
     subset = long_df[long_df["Metric"] == m]
@@ -125,13 +131,48 @@ for ax, m, lbl in zip(axes, metrics, labels):
         color='black'
     )
 
+    # Draw paired lines
+    for cond in treatments:
+
+        control = subset[subset["Condition"] == reference][["Recording", "Value"]]
+        treat = subset[subset["Condition"] == cond][["Recording", "Value"]]
+
+        merged = pd.merge(
+            control,
+            treat,
+            on="Recording",
+            suffixes=("_control", "_treat")
+        ).dropna()
+
+        x0 = order.index(reference)
+        x1 = order.index(cond)
+
+        for _, row in merged.iterrows():
+            dx = recording_offsets[row["Recording"]]
+
+            ax.plot(
+                [x0 + dx, x1 + dx],
+                [row["Value_control"], row["Value_treat"]],
+                color="gray",
+                linewidth=1,
+                alpha=0.6,
+                zorder=2
+            )
+
     # Scatter (raw data)
-    for i, values in enumerate(all_values):
-        jitter = np.random.normal(i, 0.05, size=len(values))
+    for i, cond in enumerate(order):
+
+        cond_df = subset[subset["Condition"] == cond]
+
+        x = [
+            i + recording_offsets[r]
+            for r in cond_df["Recording"]
+        ]
+
         ax.scatter(
-            jitter,
-            values,
-            color=my_palette[order[i]],
+            x,
+            cond_df["Value"],
+            color=my_palette[cond],
             s=40,
             zorder=3
         )
