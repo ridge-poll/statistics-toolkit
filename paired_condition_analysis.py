@@ -13,6 +13,14 @@ parser.add_argument(
     action="store_true",
     help="Use Wilcoxon signed-rank test instead of paired t-test."
 )
+
+parser.add_argument(
+    "--post-light-window",
+    type=float,
+    default=30,
+    help="Time in seconds after light turns off to still classify an SD as induced."
+)
+
 args = parser.parse_args()
 
 
@@ -89,7 +97,7 @@ recording_offsets = {
 }
 
 fig, axes = plt.subplots(1, len(metrics), figsize=(14, 4))
-fig.suptitle(f"Cross-Species SDs in Hypersmotic Solution: {cond}", fontsize=14, fontweight="bold")
+fig.suptitle(f"Cross-Species SDs in KCC2 Blocker: {cond}", fontsize=14, fontweight="bold")
 
 for ax, m, lbl in zip(axes, metrics, labels):
     subset = long_df[long_df["Metric"] == m]
@@ -210,7 +218,7 @@ for ax, m, lbl in zip(axes, metrics, labels):
                     nan_policy="omit"
                 )
 
-            p_text.append(f"p={pval:.3f}")
+            p_text.append(f"p={pval:.6f}")
         else:
             p_text.append("n<2")
 
@@ -226,6 +234,313 @@ for ax, m, lbl in zip(axes, metrics, labels):
 
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+
+################ New ################
+
+
+# ============================================================
+# HALORHODOPSIN LIGHT ANALYSIS
+# ============================================================
+
+# Only rows with an actual SD are included in the light analysis.
+# Rows with NaN MaxAmp1 are bookkeeping rows representing no SD.
+light_df = df[df["MaxAmp1"].notna()].copy()
+
+# Make sure timing columns are numeric
+light_df["Latency1"] = pd.to_numeric(
+    light_df["Latency1"],
+    errors="coerce"
+)
+
+light_df["Change_Time"] = pd.to_numeric(
+    light_df["Change_Time"],
+    errors="coerce"
+)
+
+# Time between the event and the most recent light change
+light_df["Time_From_Change"] = (
+    light_df["Latency1"] - light_df["Change_Time"]
+)
+
+# ------------------------------------------------------------
+# Classify SDs as induced or spontaneous
+# ------------------------------------------------------------
+
+light_df["SD_Type"] = "spontaneous"
+
+# Light is currently ON
+light_df.loc[
+    light_df["Light_Status"].str.lower() == "on",
+    "SD_Type"
+] = "induced"
+
+# Light has just turned OFF:
+# still classify as induced if within the post-light window
+light_df.loc[
+    (light_df["Light_Status"].str.lower() == "off") &
+    (light_df["Time_From_Change"] >= 0) &
+    (light_df["Time_From_Change"] <= args.post_light_window),
+    "SD_Type"
+] = "induced"
+
+# ------------------------------------------------------------
+# Count total, induced, and spontaneous SDs per recording
+# ------------------------------------------------------------
+
+light_counts = light_df.groupby(
+    ["Recording", "Condition"]
+).agg(
+    Total_SDs=("MaxAmp1", "count"),
+    Induced_SDs=(
+        "SD_Type",
+        lambda x: (x == "induced").sum()
+    ),
+    Spontaneous_SDs=(
+        "SD_Type",
+        lambda x: (x == "spontaneous").sum()
+    )
+).reset_index()
+
+# ------------------------------------------------------------
+# Find first SD after each light activation
+# ------------------------------------------------------------
+
+# Identify rows where the light was turned ON.
+#
+# Each unique Change_Time represents a light activation.
+
+light_on = light_df[
+    (light_df["Light_Status"].str.lower() == "on") &
+    light_df["Latency1"].notna() &
+    light_df["Change_Time"].notna()
+].copy()
+
+light_on["Latency_From_Light_On"] = (
+    light_on["Latency1"] - light_on["Change_Time"]
+)
+
+# Only SDs occurring after the light was turned on
+light_on = light_on[
+    light_on["Latency_From_Light_On"] >= 0
+]
+
+# First SD after each light activation
+first_sd = (
+    light_on
+    .sort_values("Latency_From_Light_On")
+    .groupby(
+        ["Recording", "Condition", "Change_Time"],
+        as_index=False
+    )
+    .first()
+)
+
+# One value per recording:
+# mean latency of the first SD following each activation
+
+latency_summary = first_sd.groupby(
+    ["Recording", "Condition"]
+).agg(
+    First_SD_Latency=("Latency_From_Light_On", "mean")
+).reset_index()
+
+
+# ============================================================
+# COMBINED FOUR-PANEL LIGHT ANALYSIS FIGURE
+# ============================================================
+
+fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+axes = axes.flatten()
+
+panel_specs = [
+    (
+        light_counts,
+        "Total_SDs",
+        "Total SDs per Recording",
+        "SD count"
+    ),
+    (
+        light_counts,
+        "Induced_SDs",
+        "Induced SDs per Recording",
+        "Induced SD count"
+    ),
+    (
+        light_counts,
+        "Spontaneous_SDs",
+        "Spontaneous SDs per Recording",
+        "Spontaneous SD count"
+    ),
+    (
+        latency_summary,
+        "First_SD_Latency",
+        "Time From Light Activation to First SD",
+        "Latency (sec)"
+    )
+]
+
+for ax, (data, value_column, title, ylabel) in zip(
+    axes,
+    panel_specs
+):
+
+    # --- compute means and SEMs ---
+    means = []
+    sems = []
+
+    for cond in order:
+
+        values = data[
+            data["Condition"] == cond
+        ][value_column].dropna().values
+
+        if len(values) > 0:
+
+            means.append(np.mean(values))
+
+            if len(values) > 1:
+                sems.append(
+                    np.std(values, ddof=1) /
+                    np.sqrt(len(values))
+                )
+            else:
+                sems.append(0)
+
+        else:
+            means.append(np.nan)
+            sems.append(np.nan)
+
+    # --- bars ---
+    for i, cond in enumerate(order):
+
+        ax.bar(
+            i,
+            means[i],
+            width=0.4,
+            color=my_palette[cond],
+            alpha=0.25,
+            edgecolor=my_palette[cond],
+            linewidth=2
+        )
+
+    # --- error bars ---
+    ax.errorbar(
+        range(len(order)),
+        means,
+        yerr=sems,
+        fmt="none",
+        capsize=5,
+        color="black"
+    )
+
+    # --- paired lines + scatter ---
+
+    p_text = "n<2"
+
+    control = data[
+        data["Condition"] == reference
+    ][["Recording", value_column]].dropna()
+
+    for cond in treatments:
+
+        treat = data[
+            data["Condition"] == cond
+        ][["Recording", value_column]].dropna()
+
+        merged = pd.merge(
+            control,
+            treat,
+            on="Recording",
+            suffixes=("_control", "_treat")
+        ).dropna()
+
+        x0 = order.index(reference)
+        x1 = order.index(cond)
+
+        for _, row in merged.iterrows():
+
+            dx = recording_offsets.get(
+                row["Recording"],
+                0
+            )
+
+            ax.plot(
+                [x0 + dx, x1 + dx],
+                [
+                    row[f"{value_column}_control"],
+                    row[f"{value_column}_treat"]
+                ],
+                color="gray",
+                linewidth=1,
+                alpha=0.6,
+                zorder=2
+            )
+
+            ax.scatter(
+                x0 + dx,
+                row[f"{value_column}_control"],
+                color=my_palette[reference],
+                s=40,
+                zorder=3
+            )
+
+            ax.scatter(
+                x1 + dx,
+                row[f"{value_column}_treat"],
+                color=my_palette[cond],
+                s=40,
+                zorder=3
+            )
+
+        # --- statistics ---
+
+        if len(merged) > 1:
+
+            if args.wilcoxon:
+
+                try:
+                    _, pval = wilcoxon(
+                        merged[f"{value_column}_control"],
+                        merged[f"{value_column}_treat"],
+                        zero_method="wilcox",
+                        alternative="two-sided"
+                    )
+
+                except ValueError:
+                    pval = np.nan
+
+            else:
+
+                _, pval = ttest_rel(
+                    merged[f"{value_column}_control"],
+                    merged[f"{value_column}_treat"],
+                    nan_policy="omit"
+                )
+
+            p_text = (
+                "all equal"
+                if np.isnan(pval)
+                else f"p={pval:.6f}"
+            )
+
+    # --- formatting ---
+
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(order)
+    ax.set_ylabel(ylabel)
+
+    ax.set_title(
+        f"{title}\n{p_text}",
+        fontsize=10,
+        fontweight="bold"
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
 plt.tight_layout()
 plt.show()
