@@ -1,17 +1,41 @@
 """
-power_analysis.py
+Power Analysis for Light-Activation-Normalized SD Metrics
+===========================================================
 
-Standalone power analysis for experimental event recordings.
-Loads the same CSV format used by paired_condition_analysis.py and
-paired_delta_analysis.py, then reports — per metric and condition pair —
-how many MORE recordings are needed to reach significance.
+Estimates statistical power for the paired reference-vs-treatment
+comparisons produced by sd_analysis.py, based on either:
+  - raw --events / --intervals CSVs (run through the same
+    build_summary() pipeline used by sd_analysis.py), or
+  - a previously saved --summary-csv (from `sd_analysis.py --save-csv`).
 
-Usage:
-    python power_analysis.py
+For each metric x treatment condition, this script:
+  1. Runs a paired t-test on the pilot data itself and reports that
+     p-value (this is "are we significant already", separate from the
+     power projections below).
+  2. Computes the paired effect size (Cohen's dz = mean(diff)/sd(diff))
+     from the pilot data.
+  3. Reports the achieved power at the pilot's current N (pairs).
+  4. Solves for the N needed to reach one or more target power levels
+     (default: 0.8), via a paired (one-sample-on-differences) t-test
+     power model.
+  5. Optionally plots a color-coded summary table (green/yellow/red by
+     how many more recordings are needed) plus power-vs-N curves, one
+     panel per metric.
 
-Dependencies:
-    pip install pandas numpy scipy matplotlib statsmodels
+This is meant to be run on an existing (possibly underpowered) pilot
+dataset to decide how many more recordings/animals are needed for a
+follow-up experiment -- it does not require re-running the raw
+analysis unless you want to.
+
+Caveats:
+  - Cohen's dz from a small pilot is itself a noisy estimate; treat
+    the required-N numbers as a rough planning aid, not a guarantee.
+  - This uses a parametric (t-test) power model. If a metric is
+    heavily non-normal or bounded (e.g. Trigger_Rate at 0%/100%),
+    treat the numbers as approximate.
 """
+
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -19,423 +43,334 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from scipy import stats
 from statsmodels.stats.power import TTestPower
-import tkinter as tk
-from tkinter import filedialog
+
+from sd_functions import build_summary, get_condition_order
 
 
-# ── Config ───────────────────────────────────────────────────────────────────
-ALPHA       = 0.05   # significance threshold
-POWER       = 0.80   # desired power (1 - β)
-MAX_SEARCH  = 200    # baseline upper bound for power-curve x-axis
-
-# Start_s / End_s in the CSV are in seconds (column names end in _s).
-# Set TIME_SCALE = 1 when timestamps are already in seconds (default).
-# Change to 1000 if your pipeline ever switches to milliseconds.
-TIME_SCALE  = 1      # divisor to convert timestamp units → seconds
-
-METRICS     = ["Rate", "Amplitude", "Duration", "AUC"]
-METRIC_UNITS = {
-    "Rate":      "events/sec",
-    "Amplitude": "mV",
-    "Duration":  "sec",
-    "AUC":       "mV·sec",
-}
-
-# Preferred name for the control condition.
-# If this exact string is not found, reference is chosen as the condition
-# with the most paired recordings (with a printed notice).
-PREFERRED_REFERENCE = "ACSF"
-# ─────────────────────────────────────────────────────────────────────────────
-
-_solver = TTestPower()
+METRICS = [
+    ("Trigger_Rate", "Trigger Rate (%)"),
+    ("SDs_Per_Activation", "SDs per Activation"),
+    ("AUC_Per_Event", "AUC per Event"),
+    ("Time_To_First_SD", "Time to First SD (s)"),
+]
 
 
-def detect_reference(summary: pd.DataFrame) -> str:
-    """
-    Identify the control/reference condition.
-
-    Priority:
-      1. PREFERRED_REFERENCE if present in the data.
-      2. The condition paired with the most recordings (most-data heuristic).
-         A notice is printed so the choice is never silent.
-    """
-    conditions = pd.unique(summary["Condition"])
-
-    if PREFERRED_REFERENCE in conditions:
-        return PREFERRED_REFERENCE
-
-    # Fallback: condition that appears in the most recordings
-    counts = summary.groupby("Condition")["Recording"].nunique()
-    reference = counts.idxmax()
-    print(
-        f"[NOTE] '{PREFERRED_REFERENCE}' not found in data. "
-        f"Using '{reference}' as reference (most recordings: {counts[reference]})."
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Power analysis for light-activation-normalized SD metrics."
     )
-    return reference
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--summary-csv", help="Previously saved sd_analysis.py summary CSV.")
+    source.add_argument("--events", help="Path to SD-event CSV (recomputes summary from raw data).")
+
+    parser.add_argument("--intervals", help="Path to light-activation interval CSV (required with --events).")
+    parser.add_argument("--post-light-window", type=float, default=30,
+                         help="Seconds after light turns off to still classify an SD as induced.")
+    parser.add_argument("--sd-filter", choices=["induced", "spontaneous", "all"], default="induced",
+                         help="Which SDs feed the metrics (only used with --events).")
+    parser.add_argument("--alpha", type=float, default=0.05, help="Significance level.")
+    parser.add_argument("--power-targets", type=float, nargs="+", default=[0.8],
+                         help="Target power level(s) to solve N for, e.g. --power-targets 0.8 0.9")
+    parser.add_argument("--max-n", type=int, default=100,
+                         help="Upper bound on N pairs to report/plot when solving for required sample size.")
+    parser.add_argument("--no-plots", action="store_true", help="Skip the power-curve plots.")
+    return parser.parse_args()
 
 
-def load_and_summarize(file_path: str) -> pd.DataFrame:
-    """Load CSV and compute per-recording per-condition summary metrics."""
-    df = pd.read_csv(file_path)
+def load_summary(args):
+    """Get the per-Recording/Condition summary either from a saved CSV
+    or by recomputing it from raw events/intervals."""
+    if args.summary_csv:
+        return pd.read_csv(args.summary_csv)
 
-    summary = df.groupby(["Recording", "Condition"]).agg(
-        Amplitude  = ("MaxAmp1",   "mean"),
-        Duration   = ("Duration1", "mean"),
-        AUC        = ("AUC1",      "mean"),
-        # Count only rows where MaxAmp1 is a valid (non-NaN) event value.
-        # This correctly handles zero-event windows stored as NaN rows.
-        EventCount = ("MaxAmp1",   lambda x: x.notna().sum()),
-        Start      = ("Start_s",   "first"),
-        End        = ("End_s",     "first"),
-    ).reset_index()
+    if not args.intervals:
+        raise SystemExit("--intervals is required when using --events.")
 
-    window_sec = (summary["End"] - summary["Start"]) / TIME_SCALE
-    summary["Rate"] = np.where(
-        (summary["EventCount"] > 0) & (window_sec > 0),
-        summary["EventCount"] / window_sec,
-        0,
-    )
-
+    _, _, summary = build_summary(args.events, args.intervals, args.post_light_window, args.sd_filter)
     return summary
 
 
-def paired_differences(summary: pd.DataFrame, reference: str, treatment: str, metric: str) -> np.ndarray:
-    """Return within-recording differences (treatment − control) for one metric."""
-    ctrl = (summary[summary["Condition"] == reference]
-            [["Recording", metric]]
-            .rename(columns={metric: "ctrl"}))
-    trt  = (summary[summary["Condition"] == treatment]
-            [["Recording", metric]]
-            .rename(columns={metric: "trt"}))
-    merged = pd.merge(ctrl, trt, on="Recording").dropna()
-    return (merged["trt"] - merged["ctrl"]).values
+def paired_effect_size(control_vals, treat_vals):
+    """Cohen's dz for a paired design: mean(diff) / sd(diff)."""
+    diffs = np.asarray(treat_vals, dtype=float) - np.asarray(control_vals, dtype=float)
+    n = len(diffs)
+    if n < 2:
+        return np.nan, n
 
-
-def required_n_paired(diffs: np.ndarray, alpha: float = ALPHA, power: float = POWER):
-    """
-    Compute the TOTAL n needed for a paired t-test at the observed effect size.
-
-    Uses exact t-distribution via statsmodels TTestPower (not a normal
-    approximation), which is accurate at the small sample sizes typical here.
-
-    Returns an int, or np.nan when the calculation is not possible.
-    """
-    if len(diffs) < 2:
-        return np.nan
-
-    mu = np.mean(diffs)
     sd = np.std(diffs, ddof=1)
-
     if sd == 0:
-        # Constant difference: if nonzero, any paired sample detects it.
-        # Minimum valid paired t-test size is 2.
-        return 2 if abs(mu) > 0 else np.nan
+        return np.nan, n
 
-    d = abs(mu) / sd  # Cohen's dz for paired design
-
-    # Suppress the convergence/precision warning statsmodels emits at
-    # extreme effect sizes — these are expected and handled by the ceiling.
-    import warnings
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=".*Iteration limit.*|.*xtol.*|.*converge.*",
-            category=RuntimeWarning,
-        )
-        try:
-            n_needed = _solver.solve_power(
-                effect_size=d,
-                alpha=alpha,
-                power=power,
-                alternative="two-sided",
-            )
-        except Exception:
-            return np.nan
-
-    return int(np.ceil(n_needed))
+    return float(np.mean(diffs) / sd), n
 
 
-def power_at_n(diffs: np.ndarray, n: int, alpha: float = ALPHA) -> float:
-    """
-    Estimate achieved power of a paired t-test at a given n.
-
-    Uses exact t-distribution via statsmodels TTestPower.
-    """
-    if len(diffs) < 2 or n < 2:
+def paired_pvalue(control_vals, treat_vals):
+    """Paired t-test p-value for the pilot data itself -- this is the
+    significance the pilot data currently has, as opposed to the power
+    projections below which are about a future/larger sample."""
+    control_vals = np.asarray(control_vals, dtype=float)
+    treat_vals = np.asarray(treat_vals, dtype=float)
+    if len(control_vals) < 2:
         return np.nan
 
-    mu = np.mean(diffs)
-    sd = np.std(diffs, ddof=1)
+    _, p = stats.ttest_rel(control_vals, treat_vals, nan_policy="omit")
+    return float(p) if not np.isnan(p) else np.nan
 
-    if sd == 0:
-        return 1.0 if abs(mu) > 0 else np.nan
 
-    d = abs(mu) / sd
+def solve_required_n(dz, alpha, power_target, max_n):
+    """Smallest N (>=2, capped at max_n) reaching power_target, or None."""
+    if dz is None or np.isnan(dz) or dz == 0:
+        return None
 
-    import warnings
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=".*Iteration limit.*|.*xtol.*|.*converge.*",
-            category=RuntimeWarning,
+    analysis = TTestPower()
+    try:
+        n = analysis.solve_power(effect_size=abs(dz), alpha=alpha, power=power_target, alternative="two-sided")
+    except Exception:
+        return None
+
+    n_req = max(2, int(np.ceil(n)))
+    return n_req if n_req <= max_n else None
+
+
+def analyze_metric(summary, reference, treatments, value_column, alpha, power_targets, max_n):
+    """One result dict per (treatment, metric) comparison."""
+    analysis = TTestPower()
+    control = summary[summary["Condition"] == reference][["Recording", value_column]].dropna()
+
+    results = []
+    for cond in treatments:
+        treat = summary[summary["Condition"] == cond][["Recording", value_column]].dropna()
+        merged = pd.merge(control, treat, on="Recording", suffixes=("_control", "_treat")).dropna()
+
+        dz, n_pairs = paired_effect_size(
+            merged[f"{value_column}_control"].values,
+            merged[f"{value_column}_treat"].values,
         )
-        try:
-            return float(_solver.power(
-                effect_size=d,
-                nobs=n,
-                alpha=alpha,
-                alternative="two-sided",
-            ))
-        except Exception:
-            return np.nan
+
+        p_value = paired_pvalue(
+            merged[f"{value_column}_control"].values,
+            merged[f"{value_column}_treat"].values,
+        )
+
+        if n_pairs >= 2 and not np.isnan(dz) and dz != 0:
+            achieved_power = float(analysis.power(effect_size=abs(dz), nobs=n_pairs, alpha=alpha))
+        else:
+            achieved_power = np.nan
+
+        required_n = {t: solve_required_n(dz, alpha, t, max_n) for t in power_targets}
+
+        results.append({
+            "Condition": cond,
+            "N_Pairs": n_pairs,
+            "P_Value": p_value,
+            "Cohens_dz": dz,
+            "Achieved_Power": achieved_power,
+            "Required_N": required_n,
+            "_max_n": max_n,
+        })
+
+    return results
 
 
-def current_pvalue(diffs: np.ndarray) -> float:
-    """One-sample t-test p-value against zero (equivalent to paired t-test)."""
-    if len(diffs) < 2:
-        return np.nan
-    _, p = stats.ttest_1samp(diffs, 0, nan_policy="omit")
-    return p
+def print_report(all_results, alpha, power_targets):
+    print("\n" + "=" * 70)
+    print("POWER ANALYSIS (paired t-test on differences, Cohen's dz)")
+    print(f"alpha = {alpha}")
+    print("=" * 70)
+
+    for metric_label, metric_results in all_results.items():
+        print(f"\n{metric_label.upper()}")
+        print("-" * 70)
+
+        header = ["Condition vs ref", "N pairs (pilot)", "p (current)", "Cohen's dz", "Achieved power"]
+        header += [f"N needed (power={t})" for t in power_targets]
+        print("\t".join(header))
+
+        for r in metric_results:
+            p_val = r["P_Value"]
+            sig_flag = "  SIGNIFICANT" if (not np.isnan(p_val) and p_val < alpha) else ""
+
+            row = [
+                r["Condition"],
+                str(r["N_Pairs"]),
+                f"{p_val:.4f}" if not np.isnan(p_val) else "NA",
+                f"{r['Cohens_dz']:.3f}" if not np.isnan(r["Cohens_dz"]) else "NA",
+                f"{r['Achieved_Power']:.3f}" if not np.isnan(r["Achieved_Power"]) else "NA",
+            ]
+            for target in power_targets:
+                n_req = r["Required_N"][target]
+                row.append(str(n_req) if n_req is not None else f">{r['_max_n']}")
+            print("\t".join(row) + sig_flag)
+
+    print("\n" + "=" * 70)
 
 
-def build_results(summary: pd.DataFrame) -> pd.DataFrame:
-    """Run power analysis for every treatment × metric combination."""
-    reference  = detect_reference(summary)
-    conditions = list(pd.unique(summary["Condition"]))
-    treatments = [c for c in conditions if c != reference]
+def build_display_table(all_results, primary_target, max_n):
+    """
+    Flatten the per-metric results into one dataframe for the summary
+    table plot -- one row per (metric, treatment) comparison.
 
+    n (needed) / n (MORE needed) are reported against primary_target
+    (by default the first value passed to --power-targets); if several
+    target power levels were requested, the console report and power
+    curves still cover all of them, but the table only has room for one.
+
+    Cohen's dz is deliberately left out here (it's in the console
+    report); Units are also left out since these metrics don't share a
+    single unit system the way the original per-recording metrics do.
+    """
     rows = []
-    for treatment in treatments:
-        for metric in METRICS:
-            diffs   = paired_differences(summary, reference, treatment, metric)
-            n_have  = len(diffs)
-            p_now   = current_pvalue(diffs)
-            n_total = required_n_paired(diffs)
-            pwr_now = power_at_n(diffs, n_have)
 
-            if np.isnan(n_total) if isinstance(n_total, float) else False:
-                n_more = np.nan
-            elif isinstance(n_total, float) and np.isnan(n_total):
-                n_more = np.nan
+    for metric_label, metric_results in all_results.items():
+        for r in metric_results:
+            n_have = r["N_Pairs"]
+            n_needed = r["Required_N"][primary_target]
+
+            if n_needed is None:
+                n_needed_str = f">{max_n}"
+                n_more_str = "NA"
+                n_more_raw = np.nan
             else:
-                n_more = max(0, n_total - n_have)
+                n_more_raw = max(0, n_needed - n_have)
+                n_needed_str = str(n_needed)
+                n_more_str = str(n_more_raw)
+
+            p_raw = r["P_Value"]
+            power_raw = r["Achieved_Power"]
 
             rows.append({
-                "Treatment":       treatment,
-                "vs Control":      reference,
-                "Metric":          metric,
-                "Units":           METRIC_UNITS[metric],
-                "n (have)":        n_have,
-                "p (current)":     round(p_now,  4) if not np.isnan(p_now)  else np.nan,
-                "Power (current)": round(pwr_now, 3) if not np.isnan(pwr_now) else np.nan,
-                "n (needed)":      int(n_total) if not (isinstance(n_total, float) and np.isnan(n_total)) else np.nan,
-                "n (MORE needed)": int(n_more)  if not (isinstance(n_more,  float) and np.isnan(n_more))  else np.nan,
-                "_diffs":          diffs,
+                "Treatment": r["Condition"],
+                "Metric": metric_label,
+                "n (have)": n_have,
+                "p (current)": f"{p_raw:.4f}" if not np.isnan(p_raw) else "NA",
+                "Power (current)": f"{power_raw:.3f}" if not np.isnan(power_raw) else "NA",
+                "n (needed)": n_needed_str,
+                "n (MORE needed)": n_more_str,
+                "_p_raw": p_raw,
+                "_n_more_raw": n_more_raw,
             })
 
     return pd.DataFrame(rows)
 
 
-# ── Power curve plot ──────────────────────────────────────────────────────────
+def plot_results_table(display_df, title, alpha, primary_target):
+    """
+    Render the summary table as a color-coded matplotlib figure:
+    green rows are already significant or already fully powered,
+    yellow rows are close (<=5 more recordings needed), red rows need
+    substantially more.
+    """
+    display_cols = [
+        "Treatment", "Metric", "n (have)",
+        "p (current)", "Power (current)", "n (needed)", "n (MORE needed)",
+    ]
+    tbl = display_df[display_cols].copy()
 
-def plot_power_curves(results: pd.DataFrame, alpha: float = ALPHA, power_target: float = POWER):
-    """One figure per treatment with one subplot per metric showing power vs n."""
-    treatments = results["Treatment"].unique()
-    reference  = results["vs Control"].iloc[0]
-
-    base_colors = ["tab:orange", "tab:green", "tab:red", "tab:purple"]
-    pal = {t: c for t, c in zip(treatments, base_colors)}
-
-    for treatment in treatments:
-        fig, axes = plt.subplots(1, len(METRICS), figsize=(14, 4), sharey=True)
-        fig.suptitle(
-            f"Power Analysis — {reference} vs {treatment}  "
-            f"(α={alpha}, target power={power_target})",
-            fontsize=13, fontweight="bold"
-        )
-
-        for ax, metric in zip(axes, METRICS):
-            row      = results[(results["Treatment"] == treatment) & (results["Metric"] == metric)].iloc[0]
-            diffs    = row["_diffs"]
-            n_have   = row["n (have)"]
-            n_needed = row["n (needed)"]
-            color    = pal[treatment]
-
-            # Expand x-range so the curve always extends past the needed n
-            try:
-                xmax = max(MAX_SEARCH, int(n_needed * 1.2) + 5)
-            except (TypeError, ValueError):
-                xmax = MAX_SEARCH
-
-            ns     = np.arange(2, xmax + 1)
-            powers = [power_at_n(diffs, int(n), alpha) for n in ns]
-
-            ax.plot(ns, powers, color=color, lw=2)
-            ax.axhline(power_target, ls="--", color="black", lw=1, label=f"Target {power_target}")
-            ax.axvline(n_have, ls=":", color="gray", lw=1.5, label=f"Have n={n_have}")
-
-            n_needed_valid = not (isinstance(n_needed, float) and np.isnan(n_needed))
-            if n_needed_valid:
-                ax.axvline(n_needed, ls="-", color=color, lw=1.5, alpha=0.7,
-                           label=f"Need n={n_needed}")
-                ax.scatter([n_needed], [power_target], color=color, zorder=5, s=60)
-
-            # Shade the gap between current and needed n
-            if n_needed_valid and n_needed > n_have:
-                ax.axvspan(n_have, n_needed, alpha=0.08, color=color)
-
-            # Annotate current power
-            pwr_now = row["Power (current)"]
-            pwr_valid = not (isinstance(pwr_now, float) and np.isnan(pwr_now))
-            if pwr_valid:
-                ax.scatter([n_have], [pwr_now], color="gray", zorder=5, s=60)
-                ax.annotate(
-                    f"  {pwr_now:.0%}",
-                    (n_have, pwr_now),
-                    fontsize=8, color="gray"
-                )
-
-            ax.set_title(f"{metric}\n({METRIC_UNITS[metric]})", fontsize=10, fontweight="bold")
-            ax.set_xlabel("n (recordings)")
-            if ax == axes[0]:
-                ax.set_ylabel("Estimated Power")
-            ax.set_ylim(0, 1.05)
-            ax.legend(fontsize=7, loc="lower right")
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-
-        plt.tight_layout()
-
-    plt.show()
-
-
-# ── Summary table plot ────────────────────────────────────────────────────────
-
-def plot_summary_table(display_df: pd.DataFrame):
-    """Render the results as a colour-coded matplotlib table."""
-    cols = ["Treatment", "Metric", "Units", "n (have)", "p (current)",
-            "Power (current)", "n (needed)", "n (MORE needed)"]
-    tbl = display_df[cols].copy()
-
-    fig_h = max(3, 0.15 * len(tbl) + 1.5)
-    fig, ax = plt.subplots(figsize=(14, fig_h))
+    fig_h = max(3, 0.35 * len(tbl) + 1.5)
+    fig, ax = plt.subplots(figsize=(11, fig_h))
     ax.axis("off")
 
-    table = ax.table(
-        cellText  = tbl.values,
-        colLabels = tbl.columns,
-        cellLoc   = "center",
-        loc       = "center",
-    )
+    table = ax.table(cellText=tbl.values, colLabels=tbl.columns, cellLoc="center", loc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(9)
     table.auto_set_column_width(col=list(range(len(tbl.columns))))
 
-    # Colour header
     for j in range(len(tbl.columns)):
         table[0, j].set_facecolor("#2d3e50")
         table[0, j].set_text_props(color="white", fontweight="bold")
 
-    # Colour rows by significance + adequacy
-    for i, (_, row) in enumerate(tbl.iterrows(), start=1):
-        p   = row["p (current)"]
-        n_m = row["n (MORE needed)"]
+    for i, (_, row) in enumerate(display_df.iterrows(), start=1):
+        p_raw = row["_p_raw"]
+        n_more_raw = row["_n_more_raw"]
 
-        try:
-            already_sig = float(p) < ALPHA
-        except (ValueError, TypeError):
-            already_sig = False
+        already_sig = (not np.isnan(p_raw)) and p_raw < alpha
+        fully_powered = (not np.isnan(n_more_raw)) and n_more_raw == 0
 
-        try:
-            more = int(float(n_m))
-        except (ValueError, TypeError):
-            more = 999
-
-        if already_sig or more == 0:
-            bg = "#d4edda"   # green — already significant / powered
-        elif more <= 5:
-            bg = "#fff3cd"   # yellow — close
+        if already_sig or fully_powered:
+            bg = "#d4edda"
+        elif not np.isnan(n_more_raw) and n_more_raw <= 5:
+            bg = "#fff3cd"
         else:
-            bg = "#f8d7da"   # red — more work needed
+            bg = "#f8d7da"
 
         for j in range(len(tbl.columns)):
             table[i, j].set_facecolor(bg)
 
     fig.suptitle(
-        f"Power Analysis Summary  (α={ALPHA}, target power={POWER})",
+        f"{title}\n(alpha={alpha}, target power={primary_target})",
         fontsize=13, fontweight="bold", y=0.98
     )
 
     legend_elements = [
         Patch(facecolor="#d4edda", label="Already significant / no more needed"),
-        Patch(facecolor="#fff3cd", label="Close — ≤5 more recordings"),
+        Patch(facecolor="#fff3cd", label="Close \u2014 \u22645 more recordings"),
         Patch(facecolor="#f8d7da", label="More recordings required"),
     ]
-    ax.legend(handles=legend_elements, loc="lower center",
-              bbox_to_anchor=(0.5, -0.05), ncol=3, fontsize=8, frameon=False)
+    ax.legend(
+        handles=legend_elements, loc="lower center",
+        bbox_to_anchor=(0.5, -0.05), ncol=3, fontsize=8, frameon=False
+    )
 
     plt.tight_layout()
     plt.show()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def plot_power_curves(all_results, alpha, max_n, power_targets):
+    metrics = list(all_results.keys())
+    fig, axes = plt.subplots(1, len(metrics), figsize=(4 * len(metrics), 4), squeeze=False)
+    axes = axes[0]
+
+    analysis = TTestPower()
+    n_range = np.arange(2, max_n + 1)
+
+    for ax, metric_label in zip(axes, metrics):
+        for r in all_results[metric_label]:
+            dz = r["Cohens_dz"]
+            if np.isnan(dz) or dz == 0:
+                continue
+            powers = analysis.power(effect_size=abs(dz), nobs=n_range, alpha=alpha)
+            ax.plot(n_range, powers, label=f"{r['Condition']} (dz={dz:.2f}, pilot N={r['N_Pairs']})")
+
+        for target in power_targets:
+            ax.axhline(target, color="gray", linestyle="--", linewidth=1)
+
+        ax.set_title(metric_label, fontsize=10, fontweight="bold")
+        ax.set_xlabel("N pairs")
+        ax.set_ylabel("Power")
+        ax.set_ylim(0, 1.05)
+        ax.legend(fontsize=7)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+    plt.show()
+
 
 def main():
-    root = tk.Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(
-        title="Select CSV file",
-        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-    )
-    if not file_path:
-        print("No file selected. Exiting.")
-        return
+    args = parse_args()
+    summary = load_summary(args)
+    reference, treatments, _ = get_condition_order(summary)
 
-    print(f"\nLoading: {file_path}")
-    summary = load_and_summarize(file_path)
-
-    reference  = detect_reference(summary)
-    conditions = list(pd.unique(summary["Condition"]))
-    treatments = [c for c in conditions if c != reference]
-
-    print(f"Reference condition : {reference}")
-    print(f"Treatment(s)        : {', '.join(treatments)}")
-    print(f"Recordings found    : {summary['Recording'].nunique()}\n")
-
-    results    = build_results(summary)
-    display_df = results.drop(columns=["_diffs"])
-
-    # ── Console summary ──────────────────────────────────────────────────────
-    print("=" * 72)
-    print(f"  POWER ANALYSIS  |  α={ALPHA}  |  target power={POWER}")
-    print("=" * 72)
-    for _, row in display_df.iterrows():
-        sig_flag = ""
-        try:
-            if float(row["p (current)"]) < ALPHA:
-                sig_flag = "  ✓ SIGNIFICANT"
-        except (ValueError, TypeError):
-            pass
-
-        more = row["n (MORE needed)"]
-        if isinstance(more, float) and np.isnan(more):
-            more_str = "  (insufficient data)"
-        elif int(more) == 0:
-            more_str = "  → already powered / significant"
-        else:
-            more_str = f"  → need {int(more)} MORE recording(s)"
-
-        print(
-            f"  {row['Treatment']:12s} | {row['Metric']:10s}"
-            f"  n={row['n (have)']:>2}  p={str(row['p (current)']):>7}"
-            f"  power={str(row['Power (current)']):>5}"
-            f"{more_str}{sig_flag}"
+    all_results = {}
+    for value_column, label in METRICS:
+        if value_column not in summary.columns:
+            continue
+        all_results[label] = analyze_metric(
+            summary, reference, treatments, value_column,
+            args.alpha, args.power_targets, args.max_n
         )
-    print("=" * 72)
 
-    # ── Plots ────────────────────────────────────────────────────────────────
-    plot_summary_table(display_df)
-    plot_power_curves(results, alpha=ALPHA, power_target=POWER)
+    print_report(all_results, args.alpha, args.power_targets)
+
+    if not args.no_plots:
+        primary_target = args.power_targets[0]
+        display_df = build_display_table(all_results, primary_target, args.max_n)
+        plot_results_table(
+            display_df,
+            "Power Analysis \u2014 Light-Activation-Normalized SD Metrics",
+            args.alpha, primary_target
+        )
+        # plot_power_curves(all_results, args.alpha, args.max_n, args.power_targets)
 
 
 if __name__ == "__main__":
